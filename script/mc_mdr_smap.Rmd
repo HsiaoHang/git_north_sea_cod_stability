@@ -1,0 +1,404 @@
+---
+title: "mc_mdr_smap"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+This script is to run MDR-Smap line by line using total population of the North Sea [al.nor]
+
+# --------------Prepare data--------------
+
+# set directory
+```{r}
+
+# set directory
+dr <- "/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc"
+
+```
+
+
+# general package
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library("tidyverse")
+library("purrr")
+library("mapplots")
+library("ggplot2")
+library("gridExtra")
+library("igraph")
+library(igraphdata)
+
+```
+
+
+# edm package
+
+```{r}
+
+library(vegan)
+library(rEDM) 
+packageVersion("rEDM")
+library(doParallel)
+library(parallel)
+library(foreach)
+library(Kendall)
+library(MASS)
+library(dplyr)
+library(glmnet)
+
+```
+
+# source Demo_MDR_function.R
+
+```{r}
+
+getwd()
+source("Demo_MDR_function.R")
+
+```
+
+
+# code settings
+
+```{r}
+seed <- 49563
+set.seed(seed)
+SaveFile <- T #T/F for saving files
+
+```
+
+
+# create age.year
+```{r}
+
+# create age.year
+age.year <- age %>% 
+  ungroup() %>% 
+  group_by(Year,Age) %>% 
+  summarise(CPUE_all_subarea = sum(CPUE)) %>% 
+  mutate_at("Age",as.character)
+
+```
+
+
+# create list [al]: time series of age group for the whole north sea
+
+this step is not necessary for the data used in this study, but is useful for data with list structure
+```{r}
+
+al <- age.year %>% pivot_wider(names_from = Age,
+                         values_from = CPUE_all_subarea,
+                         names_prefix = "A")
+
+# transform it into a list with one component
+al <- list(al)
+
+```
+
+
+# create normalised data as [al.nor]
+
+```{r}
+
+# Read dataset
+al
+
+# for loop
+al.nor <- list()
+
+
+for (i in 1:length(al)){ 
+
+da.range <- 1:nrow(al[[i]]) # Subsample for data analysis
+out.sample <- F # T/F for out-of-sample forecast
+if(out.sample){nout <- 2}else{nout <- 0}  # number of out-of-sample
+
+# (da.name <- 'mc_model202310_6_age')
+#do <- read.csv('mc_data_6_age_20231021.csv',header=T,stringsAsFactors = F)
+do <- al[[i]]
+dot <- do[da.range,1] # data time
+do <- do[da.range,-1] # time series of community data
+ndo <- nrow(do)
+nin <- ndo-nout # library sample size
+
+
+# In-sample
+do.mean <- apply(do[1:nin,],2,mean,na.rm=T)  # mean abundance in in-sample
+do.sd <- apply(do[1:nin,],2,sd,na.rm=T)      # SD of abundance in in-sample
+d <- do[1:(nin-1),]                          # In-sample dataset at time t
+d_tp1 <- do[2:(nin),]                        # In-sample dataset at time t+1
+ds <- (d-repmat(do.mean,nrow(d),1))*repmat(do.sd,nrow(d),1)^-1 # Normalized in-sample dataset at time t
+ds_tp1 <- (d_tp1-repmat(do.mean,nrow(d_tp1),1))*repmat(do.sd,nrow(d_tp1),1)^-1 # Normalized in-sample dataset at time t+1
+
+# Out-sample
+if(out.sample|nout!=0){
+  d.test <- do[nin:(ndo-1),]                 # Out-of-sample dataset at time t 
+  dt_tp1 <- do[(nin+1):ndo,]                 # Out-of-sample dataset at time t+1
+  ds.test <- (d.test-repmat(do.mean,nrow(d.test),1))*repmat(do.sd,nrow(d.test),1)^-1 # Normalized out-of-sample dataset at time t
+  dst_tp1 <- (dt_tp1-repmat(do.mean,nrow(dt_tp1),1))*repmat(do.sd,nrow(dt_tp1),1)^-1 # Normalized out-of-sample dataset at time t+1
+}else{d.test <- dt_tp1 <- dst_tp1 <- ds.test <- NULL}
+
+# Compiled data at time t 
+ds.all <- rbind(ds,ds.test)
+
+al.nor[[i]] <- ds.all
+
+}
+
+#al.nor[[1]] & ds is identical
+all.equal(al.nor[[1]],ds)
+
+```
+
+# Find E for each age of the whole north sea [al.nor]
+
+run simplex, output include [Ed.rmse.out],[Ed.rho.out ],[forecast_skill_simplex.out]
+
+E selected by min(rmse) or max(rho) is different. Ed by rmse: 4 2 8 10 10 10 Ed by rho: 2 2 2 2 2 2
+
+```{r}
+
+al.nor
+
+# Univariate simplex projection
+Emax <- 10
+cri <- 'rmse' # model selection 
+
+Ed.rmse.out <- matrix(NA, nrow = 1, ncol = 6)
+Ed.rho.out <- matrix(NA, nrow = 1, ncol = 6)
+forecast_skill_simplex.out <- matrix(NA, nrow = 1, ncol = 6)
+
+### forecast_skill_simplex <- NULL
+
+for (j in 1:length(al.nor)){
+  
+  Ed.rmse <- NULL
+  Ed.rho <- NULL
+  forecast_skill_simplex <- NULL
+  
+  for(i in 1:6){
+  spx.i <- simplex(al.nor[[j]][,i],E=2:Emax)
+  #@ extract optimal E where rmse is the minimum
+  Ed.rmse <- c(Ed.rmse,spx.i[which.min(spx.i[,cri])[1],'E'])
+  Ed.rho <- c(Ed.rho, spx[which.max(spx[,'rho'])[1],'E'])
+  
+  #@ extract rho where rmse is the minimum
+  forecast_skill_simplex <-
+    c(forecast_skill_simplex,spx.i[which.min(spx.i[,cri])[1],'rho'])
+  }
+  
+Ed.rmse.out[j,] <- Ed.rmse
+Ed.rho.out[j,] <- Ed.rho
+forecast_skill_simplex.out[j,] <- forecast_skill_simplex
+  }
+
+Ed.rmse.out
+Ed.rho.out
+forecast_skill_simplex.out
+
+```
+
+
+# Optimal E (from mc_nonlinearity.qmd)
+
+Ed.rmse.out Selected by rmse: 4 2 8 10 10 10; replace age with E > 10 to E = 6 because 6 is maximum dimension we can build from 6 age groups.
+
+```{r}
+Ed <- c(4,2,6,6,6,6)
+
+```
+
+
+#--------- Run MDR-Smap-----------------
+
+# apply function <ccm.fast.demo.seq.1> to find causal variables 
+
+```{r, message = FALSE}
+
+
+file.name.sig <- paste0(dr, sep = "/","output/6age_all_ns/mc_ccm_sig_6age_ns_1809.csv")
+
+file.name.rho <- paste0(dr, sep = "/","output/6age_all_ns/mc_ccm_rho_6age_ns_1809.csv")
+
+
+Emax = 10
+cri = 'rmse'
+
+do.CCM <- T 
+
+ccm.sig <- list()
+ccm.rho <- list()
+ccm.E <- list()
+
+
+for (i in 1:length(al.nor)){
+
+if(do.CCM){ 
+  ccm.out <- ccm.fast.demo.seq.1(al.nor[[i]],Epair=T,cri=cri,Emax=Emax)
+  ccm.sig[[i]] <- ccm.out[['ccm.sig']]
+  ccm.rho[[i]] <- ccm.out[['ccm.rho']]
+  if(SaveFile){
+  write.csv(ccm.sig, file =file.name.sig,row.names=F)
+  write.csv(ccm.rho,file = file.name.rho,row.names=F)
+  }
+} 
+  }
+
+
+# converting the output into matrix for below chunks
+ccm.sig <- ccm.sig[[1]]
+ccm.rho <- ccm.rho[[1]]
+
+# read csv files
+ccm.sig <- read.csv(file.name.sig,header=T)
+ccm.rho <- read.csv(file.name.rho,header=T)
+
+
+```
+
+
+# perform multiview embedding analysis for each node
+
+\# ccm.rho= matrix of CCM terminal rho \# ccm.sig= matrix recoding the significance of CCM between each node pair \# Ed= the optimal embedding dimension for each variable \# max_lag = the maximal time lag included in multiview embedding \# kmax= The maximal number for generating multiview SSR \# kn= Select the kn best multiview SSR \# Emax=maximal embedding dimension
+
+
+```{r, message = FALSE}
+
+# converting al.nor into matrix to run the following function
+al.matrix <- as.matrix(al.nor[[1]])
+
+# Perform multiview embedding analysis for each node
+
+file.name.elese <- paste0(dr, sep = "/","output/6age_all_ns/mc_eleseLag_6age_all_ns_1809.csv")
+
+
+do.multiview <- T 
+
+if(do.multiview){
+  esele_lag <- esim.lag.demo(al.matrix,ccm.rho,ccm.sig,Ed,kmax=10000,kn=100,max_lag=3, Emax=Emax)
+  # To avoid overwrite the original files, we save them with different names, 'XXX_NEW'.
+  if(SaveFile){write.csv (esele_lag, file = file.name.elese, row.names=F)}
+}
+
+esele <- esele_lag
+```
+
+# The computation of multiview distance
+
+```{r}
+
+dmatrix.mv <- mvdist.demo(ds,ds.all,esele)
+dmatrix.train.mvx <- dmatrix.mv[['dmatrix.train.mvx']]
+dmatrix.test.mvx <- dmatrix.mv[['dmatrix.test.mvx']]
+
+```
+
+# Leave-one-out cross validation
+
+- This is the most time-consuming part of this script
+
+-The parameter cv.unit determines the precision of selected parameters and strongly influences computation time.
+
+- Chang's example code used cv.unit=0.025 to obtain more precise estimations. This parameter may be adjusted to 0.05 or even 0.1, depending on how sensitive the results to parameter precision. 
+
+Here I set core = 10, cv unit = 0.1, one age needs 2.5 min, 6 ages need 15 min in total.
+
+@2309 re-run with cv unit = 0.05 and check if the selected parameter at the next chunk would be different  
+
+```{r}
+
+file.name.unit <- paste0(dr, sep = "/","output/6age_all_ns/output_unit_0.05_1809.csv")
+
+# @ test number of cores
+detectCores() # this laptop has 12 cores.Rule of thumb is not to exceed number of cores in the machine. So I can use 10, for example.
+
+######## Leave-one-out cross-validation for finding the optimal parameters for MDR S-map analysis
+
+do.MDR.CV <- T
+
+cv.unit <- 0.1
+alpha.so <- seq(0, 1, cv.unit);            # Sequence of alpha
+sub.da <- 1                                # Divide the computation job into five parts 
+afsp <- eqsplit(1:length(alpha.so),sub.da) # Divide the parameter space based on alpha parameter
+alf <- 1                                  # Run CV in the first parameter subset 
+
+# Cross-validation of MDR analysis    
+if(do.MDR.CV){
+  alpha.s <- alpha.so[afsp[alf,1]:afsp[alf,2]] # Subset parameter pace
+  cv.ind <- cv.MDR.demo(ds, ds_tp1, dmatrix.list=dmatrix.train.mvx, 
+                        parall=T, ncore=10, keep_intra=T,alpha.seq=alpha.s)
+  # To avoid overwrite the original files, we save them with different names, 'XXX_NEW'.
+  if(SaveFile){write.csv(cv.ind,file.name.unit,row.names=F)}
+}
+                 
+
+(cv.ind <- read.csv(file.name.unit ,header=T))
+
+
+```
+
+
+# Compiled the CV results tested under different parts of parameter space
+
+- I run parallel computation so there is only one output file; so I removed the codes for compiling seperate files
+
+```{r}
+
+file.name.cv <- paste0(dr, sep = "/","output/6age_all_ns/cv_selected_1809.csv")
+
+CompileCV=T
+
+if(CompileCV){
+  paracv.demo <- secv.demo(cv.ind)
+  write.csv(paracv.demo,file.name.cv,row.names = F)
+}
+
+(paracv.demo <- read.csv(file.name.cv,header=T))
+
+```
+
+
+# Fitting MDR S-map based on the parameters selected by CV
+
+note: I set out.sample = F
+
+```{r}
+
+file.name.nr.out <- paste0(dr, sep = "/","output/6age_all_ns/nr.out_1809.csv")
+
+file.name.jcof <- paste0(dr, sep = "/","output/6age_all_ns/jcof_1809.csv")
+
+
+do.MDR <- T
+cv.unit <- 0.1                           
+ptype <- 'aenet'                           # enet:elastic-net or msaenet: adaptive elastic-net
+
+# Select the optimal parameter set with the minimal MSE
+paracv.demo <- read.csv(file.name.cv)
+
+if(do.MDR){
+  # Fitting the MDR S-map
+  smap.demo <- MDRsmap.demo(paracv=paracv.demo,ptype=ptype,keep_intra=T,out.sample=F,
+                            ds,ds_tp1,ds.test,dst_tp1,
+                            dmatrix.list=dmatrix.train.mvx,
+                            dmatrix.test.list=dmatrix.test.mvx)
+  
+  # Save forecast skills
+  nr.out <- smap.demo[['nr.out']];
+  # To avoid overwrite the original files, we save them with different names, 'XXX_NEW'.
+  if(SaveFile){
+    write.csv(nr.out,file.name.nr.out,row.names=F)
+    # Save interaction Jacobian matrices at all time points
+    write.csv(smap.demo[['jcof']],file.name.jcof,row.names=F)
+  }
+}
+
+(nr.out <- read.csv(file.name.nr.out,header=T))
+(ja <- read.csv(file.name.jcof,header=T))
+
+
+```
+

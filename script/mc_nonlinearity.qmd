@@ -1,0 +1,327 @@
+---
+title: "prepare data + check nonlinearity"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: inline
+---
+
+This script is to check if the North Sea cod population exhibit nonlinear dynamics with following steps:
+1. arrange & normalise yearly cpue data as [nl.nor]
+2. run simplex to obtain optimal embedding dimension (E)
+3. run s-map to obtain theta, indicator for nonlinearity, and delta mae, used to test significance ot nonlinearity (next step)
+4. run simulations to generate null distributions of delta mae to compare with delta mae from the data 
+
+
+#-----prepare data-----
+
+# setup
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library("tidyverse")
+library("purrr")
+library("mapplots")
+library("ggplot2")
+library("gridExtra")
+library("stats")
+
+# set directory
+dr <- "/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc"
+
+```
+
+# load libraries
+note: simplex projection and CCM) were conducted in rEDM package version 1.2.3
+```{r}
+
+library(vegan)
+library(rEDM) 
+packageVersion("rEDM")
+library(doParallel)
+library(parallel)
+library(foreach)
+library(Kendall)
+library(MASS)
+library(dplyr)
+library(glmnet)
+source("Demo_MDR_function.R")
+seed <- 49563
+set.seed(seed)
+SaveFile <- T #T/F for saving files
+
+
+```
+
+# read & clean data
+
+Downloaded data cpue per age per subarea for all standard species on datras portal between 1977-2021 Q1 <https://datras.ices.dk/Data_products/Download/Download_Data_public.aspx>
+
+```{r}
+
+# read data
+
+file.name <- paste0(dr, sep = "/","data/raw_data/mc_NorthSea_CPUE per age per subarea_19772021.csv")
+
+(age <-  read.csv(file.name, header=T))
+
+# Remove unnecessary columns 
+age <- age %>% 
+  dplyr::select(-c(Survey,Area,AphiaID,DateofCalculation, Quarter))
+
+# filter cod
+(age <- age %>% 
+  filter(Species == "Gadus morhua"))
+
+# check if Age 0 always has CPUE = 0: Yes
+age %>% dplyr::select(Age_0) %>% 
+  summarise(mean_CPUE = max(Age_0))
+
+# Wide to long form (Not to drop NA columns)
+(age <- age %>%
+ pivot_longer(
+   cols = starts_with("Age"),
+   names_to = "Age",
+   names_prefix = "Age_",
+   values_to = "CPUE",
+   values_drop_na = F))
+
+# check if age 7-10 are always NA in the raw data: Yes
+
+age %>% filter(if_any(everything(), ~ is.na(.))) %>% 
+  group_by(Age) %>% tally() 
+
+# Remove age 0, age 7-10
+age <- age %>% 
+  mutate_at("Age", as.numeric) %>% 
+  filter(Age < 7 & Age > 0) 
+
+# Keep record after year 1981
+age <- age %>% 
+  filter(Year >=1982)
+
+# Add lon, lat
+age <- age %>% 
+   mutate(Lon = ices.rect(SubArea)$lon,
+         Lat = ices.rect(SubArea)$lat) 
+
+```
+
+# create dd.year
+
+```{r}
+
+# create dd.year
+dd.year <- age %>% 
+  ungroup() %>% 
+  group_by(Year) %>% 
+  summarise(CPUE_all_subarea_age = sum(CPUE)) %>% 
+  mutate_at("Year",as.numeric)
+
+```
+
+#-----convert to list-----
+This step is not necessary for the data used in this paper but can be useful to deal with data composed of multiple lists
+
+#create list [nl]: ts of total cpue for whole ns
+
+```{r}
+
+dd.year
+nl <- list(dd.year)
+
+```
+
+
+# create normalised nl as [nl.nor]
+
+```{r}
+
+# Read dataset
+nl[[1]]
+
+# for loop
+nl.nor <- list()
+
+da.range <- 1:nrow(nl[[1]]) # Subsample for data analysis
+out.sample <- F # T/F for out-of-sample forecast
+if(out.sample){nout <- 2}else{nout <- 0}  # number of out-of-sample
+
+# (da.name <- 'mc_model202310_6_age')
+#do <- read.csv('mc_data_6_age_20231021.csv',header=T,stringsAsFactors = F)
+do <- nl[[1]]
+dot <- do[da.range,1] # data time
+do <- do[da.range,-1] # time series of community data
+ndo <- nrow(do)
+nin <- ndo-nout # library sample size
+
+
+# In-sample
+do.mean <- apply(do[1:nin,],2,mean,na.rm=T)  # mean abundance in in-sample
+do.sd <- apply(do[1:nin,],2,sd,na.rm=T)      # SD of abundance in in-sample
+d <- do[1:(nin-1),]                          # In-sample dataset at time t
+d_tp1 <- do[2:(nin),]                        # In-sample dataset at time t+1
+ds <- (d-repmat(do.mean,nrow(d),1))*repmat(do.sd,nrow(d),1)^-1 # Normalized in-sample dataset at time t
+ds_tp1 <- (d_tp1-repmat(do.mean,nrow(d_tp1),1))*repmat(do.sd,nrow(d_tp1),1)^-1 # Normalized in-sample dataset at time t+1
+
+
+nl.nor <- ds_tp1
+
+```
+
+
+#-----identify optimal E with simplex-----
+
+E is different depending on evaluting by rmse or rho. by rmse: 5 by rho: 3
+
+```{r}
+
+# use simplex to find optimal E
+## Default lib = whole time series, pred = lib. Thus, the whole time series is used as a library and for prediction. This is the case when time series is short.
+spx <- simplex(unlist(nl.nor), E = 2:10) 
+
+# Find best E when rmse is the lowest
+spx[which.min(spx[,'rmse'])[1],'E']
+
+# Alternatively, find best E when rho is the highest
+spx[which.max(spx[,'rho'])[1],'E']
+
+```
+
+#-----identify theta (nonlinearity) with s-map -----
+
+## check optimal E
+
+Optimal E = 3 with rmse, Optimal E = 5 with rho.
+
+```{r}
+
+# convert data to vector
+nl.nor <- as.numeric(unlist(nl.nor))
+
+# test optimal E
+spx <- simplex(nl.nor, E = 2:10) 
+
+# Find best E when rmse is the lowest
+e.rmse <- spx[which.min(spx[,'rmse'])[1],'E']
+
+# Alternatively, find best E when rho is the highest
+e.rho <- spx[which.max(spx[,'rho'])[1],'E']
+
+```
+
+## run s-map, output in [smap_n] then calculate delta mae [ delta.mae.org\]
+
+-   here I chose optimal E = 5 based on maximized rho
+-   test theta between 0 and 8, following methods in Clark & Luis 2020 Nature EE
+-   here optimal theta is determined by minimised mae
+
+```{r}
+
+# run s-map, output in [smap_n]
+(smap_n <- s_map(nl.nor,E=5,lib=c(1,39), 
+                 pred=c(1,39), 
+                 theta=seq(0,8,0.1)))
+
+## extract optimal theta determined by minimising mae
+(the_n <- smap_n[which.min(smap_n$mae),"theta"][1]) # 3.7
+
+## extract optimal theta determined by maximizing rho
+(the_n <- smap_n[which.max(smap_n$rho),"theta"][1]) # 3.6
+
+## calculate delta mae original [delta.mae.org] # 0.192
+(delta.mae.org <- smap_n$mae[which(smap_n$theta==0)] - min(smap_n$mae))
+
+```
+
+## plot rho~ theta, mae~ theta
+
+```{r}
+
+# plot rho ~ theta
+plot(rho~theta,data=smap_n,type="l",xlab=expression(theta),ylab=expression(rho),col=2)
+
+# plot mae ~ theta
+plot(mae~theta,data=smap_n,type="l",xlab=expression(theta),col=2)
+
+
+```
+
+#-----check if nonlineartiy is significant 
+
+## generate simulated data [dd.sim]
+
+-   Generate phase-randomized surrogate series as in Ebisuzaki (1997), as proposed in Clark & Luis 2020 Nature EE.
+
+
+```{r}
+
+# generate randomized series from [ nl.nor ]
+dd.sim <- make_surrogate_ebisuzaki(nl.nor, num_surr = 1000)
+
+```
+
+## run s-map for simulated data, output in \[ smap.sim \]
+
+```{r}
+
+# Run S-map with loop
+smap.sim <- matrix(NA, nrow = 1000, ncol = 2)
+
+for (i in 1:1000){
+  (smap_sim <- s_map(dd.sim[,i],E=5,lib=c(1,39), 
+                 pred=c(1,39), 
+                 theta=seq(0,8,0.1)))
+  theta <- smap_sim[which.max(smap_sim$rho),"theta"][1]
+  
+  delta <- smap_sim$mae[which(smap_sim$theta==0)] - min(smap_sim$mae)
+  
+ smap.sim[i,1] <- theta
+ smap.sim[i,2] <- delta
+  
+}
+
+colnames(smap.sim) <- c("theta", "delta.mae.sim")
+```
+
+## quick compare delta mae from simulation vs original
+
+```{r}
+
+# get 95% quantiles of all randomization simulations
+delta.mae.sim <- quantile(smap.sim[,"delta.mae.sim"], probs = 0.95)
+
+# when original mae > randomization, it means that the original time series is nonlinear.
+delta.mae.org - unname(delta.mae.sim)
+
+```
+
+##[Fig S1] plot null distribution of simulated delta from [smap.sim]
+
+```{r}
+
+# transform smap.sim to a tibble for ggplot2
+plot.dd <- as_tibble_col(smap.sim[,"delta.mae.sim"], column_name = "delta.mae.sim")
+
+# calculate quantile values and store in [quantile.values]
+quantile.values <- plot.dd %>%
+  summarize(lower = quantile(delta.mae.sim, probs = .025),
+            upper = quantile(delta.mae.sim, probs = .975))
+
+
+ggplot(data = plot.dd, aes(x = delta.mae.sim))+
+  #geom_histogram(binwidth = 0.001)+
+  geom_density()+
+  # here I don't plot 0.025 percentile for simplicity
+  #geom_vline(data = quantile.values, aes(xintercept = lower)) +
+  geom_vline(data = quantile.values, aes(xintercept = upper)) +
+  geom_vline(xintercept = delta.mae.org, color = "red")+
+  theme+
+  xlab("delta mae of 1000 phase-randomized surrogate series")+ylab('Frequency')
+
+
+```
+
+
+

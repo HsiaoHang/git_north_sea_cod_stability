@@ -1,0 +1,1370 @@
+---
+title: "mc_stability_analysis"
+output: html_document
+date: "2024-02-12"
+editor_options: 
+  chunk_output_type: console
+---
+
+# general package
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library("tidyverse")
+library("purrr")
+library("mapplots")
+library("ggplot2")
+library("gridExtra")
+library("igraph")
+library(igraphdata)
+library("ggplot2")
+library(grid)
+library(cowplot)
+library(ggtext)
+library(zoo)
+
+
+```
+
+
+# edm package
+
+```{r}
+
+library(vegan)
+library(rEDM) # Some EDM analyses (e.g., simplex projection and CCM) were conducted in rEDM package ver. 1.2.3
+packageVersion("rEDM")
+library(doParallel)
+library(parallel)
+library(foreach)
+library(Kendall)
+library(MASS)
+library(dplyr)
+library(glmnet)
+
+```
+
+
+# set directory
+```{r}
+
+# set directory
+dr <- "/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc"
+
+```
+
+
+# code settings
+##(check if this code is needed)
+```{r}
+
+seed <- 49563
+set.seed(seed)
+SaveFile <- T #T/F for saving files
+
+```
+
+
+# source Demo_MDR_function.R, mc_mdr_smap.Rmd
+
+```{r}
+
+source("/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc/script/Demo_MDR_function.R")
+
+```
+
+
+# load ccm.fast.demo.seq.1 from mc_mdr_smap.Rmd
+
+```{r}
+
+ccm.fast.demo.seq.1 <- function(ds,Epair=T,cri='rmse',Emax=10){
+  if(cri=='rho'){jfun <- match.fun('which.max')}else{jfun <- match.fun('which.min')}
+  ds <- as.matrix(apply(ds,2,scale))
+  np <- nrow(ds) # time series length
+  ns <- ncol(ds) # number of nodes
+  #lib.s <- c(seq(10,nrow(ds),10),nrow(ds)) # sequence of library size
+  lib.s <- c(seq(10,nrow(ds),1),nrow(ds))
+  crirho <- qt(0.95,np-1)/(np-2+qt(0.95,np-1)^2) # critical values with alpha=0.05
+  ccm.rho <- ccm.sig <- matrix(0,ns,ns)
+  for(i in 1:ns){
+    t.begin <- proc.time()
+    for(j in 1:ns){
+      # select the optimal E for CCM based on hindcast at time= t-1 (tp=-1)
+      ccm.E <- NULL  
+      for(E.t in 2:Emax){
+        ccm.E <- rbind(ccm.E,ccm(cbind(x=ds[,i],y=ds[,j]), E = E.t, tp=-1,
+                              lib_column = "x", target_column = "y", 
+                              lib_sizes = nrow(ds),  random_libs =F))
+      }
+      Eop <- ccm.E[jfun(ccm.E[,cri]),'E'] # The optimal E for the cross-mapping from node i to node j 
+      
+      
+      # Perform CCM at time t (tp=0)      
+      ccm.out <- ccm(cbind(x=ds[,i],y=ds[,j]), E = Eop, tp=0, 
+                  lib_column = "x", target_column = "y", 
+                  lib_sizes = lib.s,  random_libs =F)
+      # aggregate the results with respect to each library size
+      ccm.seq <- aggregate(ccm.out[,'rho'],list(ccm.out[,'lib_size']),mean,na.rm=T)
+      ccm.seq <- ccm.seq[!(is.na(ccm.seq[,2])|is.infinite(ccm.seq[,2])),]
+      ccm.seq[ccm.seq[,2]<0,2] <- 0
+      termrho <- ccm.seq[nrow(ccm.seq),2]  # rho at the maximal library size (terminal rho)
+      if(nrow(ccm.seq)>=3){
+        kend <- MannKendall(ccm.seq[,2]);  # Kendall's tau test for mononotic increase
+        # Causation is significant only if both (1) Kendall's tau and (2) terminal rho are significantly larger than zero
+        ccm.sig[i,j] <- (kend$tau[1]>0)*(kend$sl[1]<0.05)*(termrho>crirho) # ccm.sig records the significance of each CCM
+      }else{ccm.sig[i,j] <- 0}
+      ccm.rho[i,j] <- termrho                                              # ccm.rho records the terminal rho
+    }#end of j
+    time.used <- proc.time() - t.begin 
+    cat("variable", i, "ccm completed:", time.used[3],"sec\n")
+  }#end of i
+  return(list(ccm.rho=ccm.rho,ccm.sig=ccm.sig))  
+}
+
+```
+
+
+# Read data
+
+```{r}
+
+# read [al.scale] CPUE per age group for all NS
+al.scale
+
+# read [nl.scale] CPUE of total population for all NS
+nl.scale
+
+# read jacobian matrix data
+file.name.jcof <- paste0(dr, sep = "/","output/6age_all_ns/jcof_1809.csv")
+
+(ja <- read.csv(file.name.jcof))
+
+
+```
+#------[fig 2] 
+
+# use [ja] to estimate stability, save in [sta.dd] 
+
+```{r}
+
+# read & clean [ja]
+ja <- as.tibble(ja)
+
+ja <- ja %>% 
+  dplyr::select (-j0) %>% 
+  filter(Insample ==1) %>% 
+  dplyr::select(-Insample) 
+
+# run eigen analysis 
+list_result <- list()
+list_eigen_position <- list()
+
+for(i in 1:39){
+  dd <- ja %>% filter(time == i)
+  m <- dd[,3:8]
+  # clark's code
+  ei.t <- eigen(m)
+  ind <- which.max(abs(ei.t$values))
+  dev <- abs(ei.t$values[ind]) # add abs() to extract
+  list_result[[i]] <- dev
+  list_eigen_position[[i]] <- ind 
+  # to check whether the dominant is always at the first position
+}
+
+
+# unlist the results
+sta.dd <- tibble(Year = seq(from = 1982, to = 2020, 1), Abs.dev = unlist(list_result))
+
+```
+
+
+# plot abundance log CPUE
+```{r}
+
+# set theme_specific [theme_s]
+theme_s <- scale_x_continuous(breaks = seq(1980, 2030, by = 5))
+
+# plot abundance over time
+age.year.plot <- age.year %>% 
+  group_by(Year) %>% 
+  mutate (CPUE_all = sum(CPUE_all_subarea))
+
+(abundance.plot <- age.year.plot %>% 
+  ggplot()+
+  geom_line(aes(x = Year, y =
+                  log(CPUE_all_subarea), 
+                color = Age), size = 0.5)+
+  geom_line(aes(x = Year, 
+                y = log(CPUE_all)), size = 1.5)+
+  theme+
+  ylab("Abundance (log CPUE)")+
+  theme_bw() +
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = 'none'
+        )+ theme_s+
+    scale_color_manual(values=c("#c7e9b4","#7fcdbb","#41b6c4", "#1d91c0", "#225ea8","#0c2c84"))+
+    ylim(2,10))
+  #+facet_grid(vars(Age))
+
+
+```
+
+
+#[fig1a] plot abundance not log transformed
+```{r}
+# plot abundance over time
+age.year.plot <- age.year %>% 
+  group_by(Year) %>% 
+  mutate (CPUE_all = sum(CPUE_all_subarea))
+
+(abundance.plot.not.log <- age.year.plot %>% 
+  ggplot()+
+  geom_line(aes(x = Year, y =
+                  (CPUE_all_subarea/1000), 
+                color = Age), size = 1)+
+  geom_line(aes(x = Year, 
+                y = (CPUE_all/1000)), size = 1.5)+
+  theme+
+  ylab("Abundance (thousand CPUE)")+
+  theme_bw() +
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = 'none'
+        )+ theme_s+
+    scale_color_manual(values=c("#c7e9b4","#7fcdbb","#41b6c4", "#1d91c0", "#225ea8","#0c2c84")))
+
+
+```
+
+
+
+#[fig1a] plot abundance not log transformed diff color
+```{r}
+# plot abundance over time
+age.year.plot <- age.year %>% 
+  group_by(Year) %>% 
+  mutate (CPUE_all = sum(CPUE_all_subarea))
+
+(abundance.plot.not.log.diff.color <- age.year.plot %>% 
+  ggplot()+
+  geom_line(aes(x = Year, y =
+                  (CPUE_all_subarea/1000), 
+                color = Age), size = 1)+
+  geom_line(aes(x = Year, 
+                y = (CPUE_all/1000)), size = 1.5)+
+  theme+
+  ylab("Abundance (thousand CPUE)")+
+  theme_bw() +
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = 'none'
+        )+ theme_s+
+ scale_colour_brewer(palette="Paired"))
+
+```
+
+
+#[fig1a] plot abundance legend diff color
+```{r}
+
+# plot abundance over time
+age.year.plot.legend <- age.year %>% 
+  group_by(Year) %>% 
+  mutate (CPUE_all = sum(CPUE_all_subarea))
+
+(abundance.plot.not.log.diff.color <- age.year.plot %>% 
+  ggplot()+
+  geom_line(aes(x = Year, y =
+                  (CPUE_all_subarea/1000), 
+                color = Age), size = 1)+
+  geom_line(aes(x = Year, 
+                y = (CPUE_all/1000)), size = 1.5)+
+  theme+
+  ylab("Abundance (thousand CPUE)")+
+  theme(legend.position = "top", legend.direction = "horizontal")+
+  # theme_bw() +
+  # theme(axis.line = element_line(),
+  #       panel.grid.major = element_blank(),
+  #       panel.grid.minor = element_blank(),
+  #       panel.background = element_blank(),
+  #       panel.border = element_blank(),
+  #       legend.position = 'none'
+  #       )+ theme_s+
+ scale_colour_brewer(palette="Paired"))
+
+```
+
+
+# calculate distance to 1 & rolling mean of stability 
+```{r}
+
+# Calculate distance to 1 & absolute distance
+
+sta.dd <- sta.dd %>% 
+  mutate(distance_1 = Abs.dev-1,
+         distance_1_abs =abs(distance_1))
+
+
+# calculate rolling mean of distance
+
+sta.dd <- sta.dd %>%
+  mutate(distance_1_roll_5 = rollmean(distance_1, k=5, fill=NA, align='right')) %>% 
+  mutate(distance_1_abs_roll_5 = rollmean(distance_1_abs, k=5, fill=NA, align='right'))
+
+  
+# define positive or negative eigenvalue
+
+sta.dd <- sta.dd %>% 
+   mutate(dev.sign = 
+            replace(Abs.dev, Abs.dev <1, "<1")) %>% 
+   mutate(dev.sign = replace(dev.sign, Abs.dev >1, ">1"))
+  
+
+# Calculate rolling mean
+
+sta.dd <- sta.dd %>%
+  mutate(roll_3 = rollmean(Abs.dev, k=3, fill=NA, align='right')) %>% 
+  mutate(roll_4 = rollmean(Abs.dev, k=4, fill=NA, align='right')) %>% 
+  mutate(roll_5 = rollmean(Abs.dev, k=5, fill=NA, align='right'))
+  
+
+
+```
+
+
+# [fig1c] plot stability over time
+```{r}
+
+(stability.plot <- ggplot(sta.dd)+ 
+  geom_line(size = 1,aes(x = Year, y = Abs.dev))+
+  xlab("Year")+
+  ylab("Population stability")+
+  theme_bw()+
+  theme_s+
+  geom_hline(yintercept=1, linetype="dashed")+
+   scale_y_continuous(
+    breaks = seq(from =0.4, to = 1.6,
+                       by = 0.2),
+    limits = c(0.2, 1.6))+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = c(0.9, 0.7))+
+   geom_line(size = 1, color = 'red',
+             aes(x = Year, y = roll_5))+
+   geom_vline(xintercept=2000, linetype="dashed"))
+  
+
+
+# bind two plots
+arranged.plot <- grid.arrange(abundance.plot, stability.plot)
+
+grid.text("a)", x = unit(0.01, "npc"), y = unit(0.9, "npc") + unit(8, "mm"), just = "left") # add (a)
+grid.text("b)", x = unit(0.01, "npc"), y = unit(0.4, "npc") + unit(8, "mm"), just = "left") # add (b)
+
+```
+
+# plot distance to 1
+```{r}
+
+(distance.plot <- ggplot(sta.dd,
+                         aes(x = Year, y = distance_1))+ 
+  geom_col()+
+  xlab("Year")+
+  ylab("distance to 1")+
+  theme_bw()+
+  theme_s+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = c(0.9, 0.7))+
+   geom_line(size = 1, color = 'red',
+             aes(x = Year, y = distance_1_roll_5))+
+    geom_vline(xintercept=2000, linetype="dashed"))
+
+
+(distance.absolute.plot <- 
+    ggplot(sta.dd,
+           aes(x = Year, y = distance_1_abs))+ 
+  geom_col(aes(fill = dev.sign))+
+  xlab("Year")+
+  ylab("absolute distance to 1")+
+  theme_bw()+
+  theme_s+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = c(0.9, 0.7))+
+     geom_line(size = 1, color = 'black',
+             aes(x = Year, y = distance_1_abs_roll_5))+
+     geom_vline(xintercept=2000, linetype="dashed"))
+  
+
+# plot stability, distance, and absolute distance
+
+(all3.plot <- grid.arrange(stability.plot,
+                       distance.plot,
+                       distance.absolute.plot))
+
+```
+
+
+# [fig1a] abundance plot with legend
+```{r}
+
+(abundance.legend.plot <- age.year.plot %>% 
+  ggplot()+
+  geom_line(aes(x = Year, y =
+                  log(CPUE_all_subarea), 
+                color = Age))+
+  geom_line(aes(x = Year, 
+                y = log(CPUE_all)),
+            size = 1.2)+
+  theme+
+  ylab("Abundance \n (log CPUE)")+
+  theme_bw() +
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = 'top',
+        )+ theme_s+
+    guides(color = guide_legend(nrow = 1))+
+   scale_color_manual(values=c("#c7e9b4","#7fcdbb","#41b6c4", "#1d91c0", "#225ea8","#0c2c84"))) # legend 1 line
+
+
+```
+
+
+# plot by age (not finished yet)
+```{r}
+
+# set theme_specific [theme_s]
+theme_s <- scale_x_continuous(breaks = seq(1980, 2030, by = 5))
+
+# bind abundance by age and total abundance
+
+
+(abundance.plot <- age.year.plot %>% 
+  ggplot()+
+  geom_line(aes(x = Year, y =
+                  log(CPUE_all_subarea), 
+                color = Age), size = 1)+
+  geom_line(aes(x = Year, 
+                y = log(CPUE_all)), size = 1.4)+
+  theme+
+  ylab("Abundance \n (log CPUE)")+
+  theme_bw() +
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = 'none'
+        )+ theme_s+
+    scale_color_manual(values=c("#c7e9b4","#7fcdbb","#41b6c4", "#1d91c0", "#225ea8","#0c2c84"))+
+    facet_grid(vars(Age)))
+
+
+age.year 
+
+dd.year %>% 
+  mutate(Age = '0_total') 
+
+```
+
+
+# plot age structure per 10 years
+```{r}
+
+# prepare structure.dd
+structure.dd <- age.year %>%
+  mutate(period = 
+           replace(Year,
+                  Year <= 1990, 
+                   "1982-1990")) %>% 
+  mutate(period = 
+           replace(period,
+                  Year <= 2000 & Year >=1991, 
+                   "1991-2000")) %>% 
+  mutate(period = 
+           replace(period,
+                  Year <= 2010 & Year >=2001, 
+                   "2001-2010")) %>% 
+  mutate(period = 
+           replace(period,
+                   Year >=2011, 
+                   "2011-2021")) %>% 
+  group_by(Age,period) %>% 
+  summarise(cpue = sum(CPUE_all_subarea))
+
+  
+
+(structure.plot <- ggplot(data= structure.dd, 
+                         aes(x=Age, y=cpue/1000, fill = Age)) +
+  geom_bar(stat="identity")+
+  facet_wrap(vars(period), ncol = 4)+
+      scale_fill_manual(values=c("#c7e9b4","#7fcdbb","#41b6c4", "#1d91c0", "#225ea8","#0c2c84"))+
+  theme_bw() +
+  theme(
+        axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        #panel.border = element_blank(),
+        legend.position = 'none',
+        # plot.margin = margin(t = 0, r = 10, 
+        #                      b = 0, l = 0, unit = "pt")
+        )+
+  ylab('Abundance (thousand CPUE)'))
+  
+  
+  
+```
+
+# [fig1b] plot age structure per 20 years
+```{r}
+
+# prepare structure.dd
+structure.dd.20yr <- age.year %>%
+  mutate(period = 
+           replace(Year,
+                  Year <= 2000, 
+                   "1982-2000")) %>% 
+  mutate(period = 
+           replace(period,
+                   Year >=2001, 
+                   "2001-2021")) %>% 
+  group_by(Age,period) %>% 
+  summarise(cpue = sum(CPUE_all_subarea))
+
+  
+
+(structure.plot.20yr <- ggplot(data= structure.dd.20yr, 
+                         aes(x=Age, y=cpue/1000, fill = Age)) +
+  geom_bar(stat="identity")+
+  facet_wrap(vars(period), ncol = 2)+
+      scale_fill_manual(values=c("#c7e9b4","#7fcdbb","#41b6c4", "#1d91c0", "#225ea8","#0c2c84"))+
+  theme_bw() +
+  theme(
+        axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        #panel.border = element_blank(),
+        legend.position = 'none',
+        # plot.margin = margin(t = 0, r = 10, 
+        #                      b = 0, l = 0, unit = "pt")
+        )+
+  ylab('Abundance (thousand CPUE)')+
+  ylim(0,80))
+  
+  
+  
+```
+
+
+# [fig1b] plot age structure per 20 years: diff color
+```{r}
+
+# prepare structure.dd
+structure.dd.20yr <- age.year %>%
+  mutate(period = 
+           replace(Year,
+                  Year <= 2000, 
+                   "1982-2000")) %>% 
+  mutate(period = 
+           replace(period,
+                   Year >=2001, 
+                   "2001-2021")) %>% 
+  group_by(Age,period) %>% 
+  summarise(cpue = sum(CPUE_all_subarea))
+
+  
+
+(structure.plot.20yr.diff.color <- ggplot(data= structure.dd.20yr, 
+                         aes(x=Age, y=cpue/1000, fill = Age)) +
+  geom_bar(stat="identity")+
+  facet_wrap(vars(period), ncol = 2)+
+      # scale_fill_manual(values=c("#c7e9b4","#7fcdbb","#41b6c4", "#1d91c0", "#225ea8","#0c2c84"))+
+    scale_fill_brewer(palette="Paired")+
+  theme_bw() +
+  theme(
+        axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        #panel.border = element_blank(),
+        legend.position = 'none',
+        # plot.margin = margin(t = 0, r = 10, 
+        #                      b = 0, l = 0, unit = "pt")
+        )+
+  ylab('Abundance (thousand CPUE)')+
+  ylim(0,80))
+  
+  
+  
+```
+
+
+# bind 3 plots: abundance+ age structure+ stability
+```{r}
+# bind 3 plots
+arranged.plot <- grid.arrange(abundance.plot.not.log, structure.plot.20yr, stability.plot)
+
+grid.text("(a)", x = unit(0.01, "npc"), y = unit(0.9, "npc") + unit(8, "mm"), just = "left") # add (a)
+grid.text("(b)", x = unit(0.01, "npc"), y = unit(0.6, "npc") + unit(8, "mm"), just = "left") # add (b)
+grid.text("*(c)", x = unit(0.01, "npc"), y = unit(0.3, "npc") + unit(8, "mm"), just = "left") # add (c)
+```
+
+
+# bind 3 plots: abundance+ age structure+ stability:diff color
+```{r}
+# bind 3 plots
+arranged.plot <- grid.arrange(abundance.plot.not.log.diff.color, structure.plot.20yr.diff.color, stability.plot)
+
+grid.text("(a)", x = unit(0.01, "npc"), y = unit(0.9, "npc") + unit(8, "mm"), just = "left") # add (a)
+grid.text("(b)", x = unit(0.01, "npc"), y = unit(0.6, "npc") + unit(8, "mm"), just = "left") # add (b)
+grid.text("(c)", x = unit(0.01, "npc"), y = unit(0.3, "npc") + unit(8, "mm"), just = "left") # add (c)
+
+```
+
+# calculate statistics to put in the graph
+```{r}
+
+# proportion of age to total abundance
+(structure.dd.20yr %>% 
+  group_by(period) %>% 
+  mutate(total_cpue = sum(cpue)) %>% 
+  ungroup() %>% 
+  mutate(proportion = round ((cpue/total_cpue)*100,0)))
+
+# mean and sd of population stability
+(sta.dd %>% 
+  mutate(period = 
+           replace(Year,
+                  Year <= 2000, 
+                   "1982-2000")) %>% 
+  mutate(period = 
+           replace(period,
+                   Year >=2001, 
+                   "2001-2021")) %>% 
+  group_by(period) %>% 
+  summarise(mean_dev = round(mean(Abs.dev),2),
+            sd_dev = round(sd(Abs.dev),2)))
+  
+
+# check difference before and after 2000 for age 1 and 2
+20724.909/54825.356	 # 37% 
+100-37 # dropped 63%
+20705.683/58602.759	 # 35%
+100-35 # dropped 65%
+
+
+```
+
+
+# calculate mean abundance 1983-2000, 2001-2021
+```{r}
+
+# mean abundance
+dd.year %>% 
+  mutate(phase = 
+           replace(Year,
+                  Year <= 2000, 
+                   "before_2000")) %>% 
+  mutate(phase = 
+           replace(phase,
+                  Year>=2001, 
+                   "after_2000")) %>% 
+  group_by(phase) %>% 
+  summarise(cpue = mean(CPUE_all_subarea_age))
+  
+2847/7524 # 0.37 proportion of total abundance before 2000/after 2000
+
+
+# proportion of age 1 and 2 
+age.year %>% 
+  mutate(phase = 
+           replace(Year,
+                  Year <= 2000, 
+                   "before_2000")) %>% 
+  mutate(phase = 
+           replace(phase,
+                  Year>=2001, 
+                   "after_2000")) %>% 
+  mutate(age_2groups =
+           replace(Age,
+                   Age %in% c('1','2'), 'age1_2')) %>% 
+  mutate(age_2groups =
+           replace(age_2groups,
+                   Age %in% c('3','4',
+                              '5','6'), 'age3_6')) %>% 
+  group_by(age_2groups, phase) %>% 
+  # here we get cpue of age 1-2 & 3-6 before 2000 & after 2000
+  summarise(cupe = sum(CPUE_all_subarea)) 
+
+
+113428/(113428+29543) #79 %  age 1-2/total age before 2000
+41430/(41430+18375) #69 % age 1-2/total age after 2000
+
+
+```
+
+
+
+
+#----------[fig 3] interactions between age groups
+
+# transform ja to long form <ja.dd>
+
+Note that for jacobian matrix output [ja], columns "A1","A2","A3","A4","A5","A6" are explanatory variables. The second column named "variable" is the responsible variable (predicted age). This direction is the same as the jacobian matrix.
+
+output 7 x 10
+```{r}
+
+ja.dd <- ja %>%
+ pivot_longer(
+   cols = c("A1","A2","A3","A4","A5","A6"),
+   names_to = "explanatory_age",
+   values_to = "jacobian",
+   values_drop_na = TRUE) %>% 
+  mutate (response_age = 
+            paste("A", sep = "", variable)) %>% 
+  #select(-variable) %>% 
+  relocate(response_age, .before = jacobian) %>% 
+  mutate(year = 1981+time)
+  
+```
+
+
+# compute Jii-1 and create <ja.dd.1>
+
+```{r}
+
+ja.dd.1 <- ja.dd %>% 
+   mutate(jacobian = ifelse(explanatory_age == response_age,jacobian-1 , jacobian))
+  
+```
+
+
+# check why a3 has almost constant interactions over time
+```{r}
+
+ja.dd.1 %>% filter(response_age =='A3')
+ja %>% filter(variable =='3')
+
+```
+
+
+# [Fig S2] plot all interactions over time
+note: use ja.dd or ja.dd.1 with jii-1 
+```{r}
+
+# plot each age as predicted variable
+
+fun_plot_interaction <- function(filter_res_age, title){
+  dd <- ja.dd.1 %>% filter(response_age  == filter_res_age) 
+  ggplot(dd,aes(x = year, y = jacobian, color = explanatory_age))+ 
+  geom_point()+
+  geom_line()+theme_bw()+ 
+    ylim(-2.3, 2.3)+
+    ylab('Interaction strength')+ xlab('Year')+
+    ggtitle(paste0(title, 
+                   sep = " ", 
+                   "as predictor"))+
+    scale_x_continuous(breaks = seq(1980, 2030, by = 5))+
+    scale_colour_brewer(palette="Paired")+
+    theme_bw() +
+      labs( col="explanatory age")+
+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank())
+}
+
+
+
+p1 <- fun_plot_interaction(filter_res_age = "A1", title = "age-1 group")
+p2 <- fun_plot_interaction(filter_res_age = "A2", title = "age-2 group")
+p3 <- fun_plot_interaction(filter_res_age = "A3", title = "age-3 group")
+p4 <- fun_plot_interaction(filter_res_age = "A4", title = "age-4 group")
+p5 <- fun_plot_interaction(filter_res_age = "A5", title = "age-5 group")
+p6 <- fun_plot_interaction(filter_res_age = "A6", title = "age-6+ group")
+
+grid.arrange(p1,p2,p3,p4,p5,p6, ncol=2) # output 7 x 10
+
+
+```
+
+
+# Plot self-regulation
+```{r}
+
+fun_plot_links <- 
+  function(filter_res, filter_exp, title, title2){
+  dd <- ja.dd.1 %>% 
+    filter(response_age  == filter_res,
+           explanatory_age == filter_exp)
+  
+  ggplot(dd,aes(x = year, y = jacobian))+ 
+  geom_point()+
+  geom_line()+ xlab('Year')+
+    ylim(-2.3, 2.3)+ ylab("Interaction strength")+
+    geom_hline(yintercept=0, linetype="dashed")+
+    ggtitle(paste0(title, sep = " ", 
+                   title2))+
+    scale_x_continuous(breaks = seq(1980, 2030, by = 5))+
+    theme_bw() +
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank())
+    
+}
+
+
+# plot self-regulation strengths
+p1 <- fun_plot_links (filter_res = "A1", filter_exp = "A1",
+                      title = "Self-regulation of", 
+                      title2 = " age-1 group")
+p2 <- fun_plot_links (filter_res = "A2", filter_exp = "A2",
+                      title = "Self-regulation of", 
+                      title2 = "age-2 group")
+p3 <- fun_plot_links (filter_res = "A3", filter_exp = "A3",
+                      title = "Self-regulation of", 
+                      title2 = "age-3 group")
+p4 <- fun_plot_links (filter_res = "A4", filter_exp = "A4",
+                      title = "Self-regulation of", 
+                      title2 = "age-4 group")
+p5 <- fun_plot_links (filter_res = "A5", filter_exp = "A5",
+                      title = "Self-regulation of", 
+                      title2 = "age-5 group")
+p6 <- fun_plot_links (filter_res = "A6", filter_exp = "A6",
+                      title = "Self-regulation of", 
+                      title2 = "age-6+ group")
+
+grid.arrange(p1,p2,p3,p4,p5,p6, ncol=2) # output 7 x 10
+
+```
+
+# Plot growth from one age to the next
+```{r}
+
+p1 <- fun_plot_links (filter_res = "A2", filter_exp = "A1",
+                      title = "age 1", 
+                      title2 = "grow to age 2")
+p2 <- fun_plot_links (filter_res = "A3", filter_exp = "A2",
+                      title = "age 2", 
+                      title2 = "grow to age 3")
+p3 <- fun_plot_links (filter_res = "A4", filter_exp = "A3",
+                      title = "age 3", 
+                      title2 = "grow to age 4")
+p4 <- fun_plot_links (filter_res = "A5", filter_exp = "A4",
+                      title = "age 4", 
+                      title2 = "grow to age 5")
+p5 <- fun_plot_links (filter_res = "A6", filter_exp = "A5",
+                      title = "age 5", 
+                      title2 = "grow to age 6")
+
+grid.arrange(p1,p2,p3,p4,p5, ncol=2) # output 7 x 10
+
+```
+
+
+# take mean jacobian over time [ja.dd.mean] and plot
+note: use ja.dd or ja.dd.1 with jii-1
+```{r}
+
+# calculate mean jacobian over time
+ja.dd.mean <- ja.dd %>% group_by(explanatory_age, response_age) %>%
+  summarise(mean_ja = mean(jacobian)) 
+
+# plot
+ggplot(ja.dd.mean,aes(y = mean_ja, x = explanatory_age))+ 
+  geom_boxplot()+
+  facet_wrap("response_age")+theme_bw()
+
+
+```
+
+
+# assign jacobian by sign & strength [ja.dd.mean.cat]
+
+categorise to positive/negative with weak, medium, strong links
+
+```{r}
+
+ja.dd.mean.cat <- ja.dd.mean %>% 
+  # remove 3 edges which mean jacobian = 0
+  filter (mean_ja != 0) %>% 
+  # create mean_jacobian_sign to classify into positive/negative edges
+  mutate(mean_ja_sign = 
+           ifelse((mean_ja > 0), 
+                  "positive", "negative")) %>% 
+  # create mean_jacobian_strength for positive values
+  mutate(mean_ja_strength = 
+           replace(mean_ja,
+                   between(mean_ja, 0,0.2), 
+                   "weak")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, 0.2,0.4), 
+                   "medium")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                  mean_ja > 0.4, 
+                   "strong")) %>% 
+  # create mean_jacobian_strength for negative values
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, -0.2,0), 
+                   "weak")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, -0.4,-0.2), 
+                   "medium")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                  mean_ja < - 0.4, 
+                   "strong")) 
+
+```
+
+
+# assign jacobian by sign & strength before after 2000 [ja.dd.mean.cat.year]
+
+```{r}
+
+# take mean jacobain before & after year 2000
+
+(ja.dd.mean.period <- ja.dd %>% 
+  mutate(period = 
+           replace(year,
+                  year <= 2000, '1982-2000')) %>% 
+  mutate(period = 
+           replace(period,
+                  year > 2000, 
+                   "2000-2020")) %>% 
+  group_by(explanatory_age, response_age, period) %>%
+  summarise(mean_ja = mean(jacobian))) 
+
+
+# assign jacobian by sign and strength
+
+ja.dd.mean.cat.period <- ja.dd.mean.period %>% 
+  # remove 3 edges which mean jacobian = 0
+  filter (mean_ja != 0) %>% 
+  # create mean_jacobian_sign to classify into positive/negative edges
+  mutate(mean_ja_sign = 
+           ifelse((mean_ja > 0), 
+                  "positive", "negative")) %>% 
+  # create mean_jacobian_strength for positive values
+  mutate(mean_ja_strength = 
+           replace(mean_ja,
+                   between(mean_ja, 0,0.2), 
+                   "weak")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, 0.2,0.4), 
+                   "medium")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                  mean_ja > 0.4, 
+                   "strong")) %>% 
+  # create mean_jacobian_strength for negative values
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, -0.2,0), 
+                   "weak")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, -0.4,-0.2), 
+                   "medium")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                  mean_ja < - 0.4, 
+                   "strong")) %>%
+  # sort tibble by period
+  arrange(period) %>% 
+  # relocate columns
+  relocate(period, .before = 'explanatory_age') %>%
+  relocate(mean_ja, .after = 'mean_ja_strength')
+
+ja.dd.mean.cat.period
+
+
+```
+
+# jii-1: assign jacobian by sign & strength before after 2000 [ja.dd.mean.cat.year]
+note: category by 0.3 for 4 categories
+```{r}
+
+# take mean jacobain before & after year 2000
+
+(ja.dd.mean.period.1<- ja.dd.1%>% 
+  mutate(period = 
+           replace(year,
+                  year <= 2000, '1982-2000')) %>% 
+  mutate(period = 
+           replace(period,
+                  year > 2000, 
+                   "2000-2020")) %>% 
+  group_by(explanatory_age, response_age, period) %>%
+  summarise(mean_ja = mean(jacobian))) 
+
+
+# assign jacobian by sign and strength
+
+ja.dd.mean.cat.period.1 <- ja.dd.mean.period.1 %>% 
+  group_by(explanatory_age, response_age) %>% 
+  # remove 3 edges which mean jacobian = 0
+  filter (mean_ja != 0) %>% 
+  # create mean_jacobian_sign to classify into positive/negative edges
+  mutate(mean_ja_sign = 
+           ifelse((mean_ja > 0), 
+                  "positive", "negative")) %>% 
+  # create mean_jacobian_strength for positive values
+  mutate(mean_ja_strength = 
+           replace(mean_ja,
+                   between(mean_ja, 0,0.3), 
+                   "weak")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, 0.3,0.6), 
+                   "medium")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, 0.6,0.9), 
+                   "strong")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                  mean_ja > 0.9, 
+                   "very strong")) %>% 
+  # create mean_jacobian_strength for negative values
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, -0.3,0), 
+                   "weak")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, -0.6,-0.3), 
+                   "medium")) %>% 
+   mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, -0.9,-0.6), 
+                   "strong")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                  mean_ja < - 0.9, 
+                   "very strong")) %>%
+  # sort tibble by period
+  arrange(period) %>% 
+  # relocate columns
+  relocate(period, .before = 'explanatory_age') %>%
+  relocate(mean_ja, .after = 'mean_ja_strength')
+
+ja.dd.mean.cat.period.1
+
+# # check min & max mean jacobian value
+# ja.dd.mean.cat.period.1 %>% 
+#   arrange(mean_ja) # -1.2 - 0.7
+
+```
+
+
+#--------identify most vulnerable group eigenvector ranking (Medeiros et al 2023)
+
+# code from Medeiros 2023 <forecast_smap_empirical_time_series>
+- Based on Medeiros 2023, leading eivenvalue is the largest real part of the eigenvalue (quote Medeiros 2023 Box 2: vi is the real part of the ith eigenvector of J, 𝜆i is the real part of the ith eigenvalue). 
+
+- Based on Medeiros 2023, ranking of species is the order of absolute value of element of the dominant eigenvector (quote Medeiros 2023: we compute the alignment of species i with v1 as the absolute value of its ith element (∣ v1i ∣), where ‖ v1 ‖ = 1. We define the order of ∣ v1i ∣ values across species as the eigenvector ranking and use it to predict the order of ⟨si⟩)
+
+```{r, eval = FALSE}
+
+#-----from Medeiros 2023 <forecast_smap_empirical_time_series>
+
+## leading eigenvalue
+smap_eigenvalue[i] <- max(Re(eigen_dec$values))
+
+## leading eigenvector
+order_values <- order(Re(eigen_dec$values), decreasing = TRUE)
+smap_eigenvector[[i]] <- Re(eigen_dec$vectors)[ , order_values[1]]
+
+
+#----from Medeiros 2023 <jacobian_sensitivities_synthetic_time_series>
+
+## decreasing order of eigenvalues
+values_order <- order(Re(eigen_J_list[[i]]$values), decreasing = TRUE)
+
+## extracting ordered eigenvalues
+values[[i]] <- Re(eigen_J_list[[i]]$values)[values_order]
+
+## extracting leading eigenvector 
+vectors[[i]] <- Re(eigen_J_list[[i]]$vectors)[ , values_order[1]]
+
+## eigenvector alignments
+### the denominator is possibly the sum of square of all element of the dominant eigenvector, it is for standardization.
+eigen_alignments[[i]] <- abs(vectors[[i]] / sqrt(sum(vectors[[i]]^2))) 
+
+```
+
+
+# calculate eigenvector alignment, result in [eigen.alignment]
+Based on Medeiros 2023, I took the mean of the raking over time to define the final rank
+
+```{r}
+
+dd <- ja %>% filter(time == 1)
+m <- dd[,3:8]
+
+#----snippet: based on Meidros's code
+## order eigenvalue
+order_values <- order(Re(eigen(m)$values), decreasing = TRUE)
+## extract dominant eigenvector
+smap_eigenvector <- Re(eigen(m)$vectors)[order_values[1],]
+## standardize and take absolute value for each element
+eigen_alignments <- abs(smap_eigenvector / sqrt(sum(smap_eigenvector^2)))
+
+
+# for loop moving forward one point at a time
+list_eigen_alignment <- list()
+
+for(i in 1:39){
+  dd <- ja %>% filter(time == i)
+  m <- dd[,3:8]
+  ## order eigenvalue
+  order_values <- order(Re(eigen(m)$values), decreasing = TRUE)
+  ## extract dominant eigenvector
+  smap_eigenvector <- Re(eigen(m)$vectors)[order_values[1],]
+  ## standardize and take absolute value for each element
+  eigen_alignments <- abs(smap_eigenvector / sqrt(sum(smap_eigenvector^2)))
+  # store result
+  list_eigen_alignment [[i]] <- eigen_alignments
+  }
+
+# unlist the results
+eigen.alignment <- tibble(
+  age = rep(seq(from = 1, to = 6, 1), times = 39), 
+  year = rep(seq(from = 1982, to = 2020, 1), each = 6),
+  eigen_alignment = unlist(list_eigen_alignment)) %>% 
+  mutate_at("age", as.factor)
+
+```
+
+
+# plot eigen alignment per age over time
+```{r}
+
+eigen.alignment
+
+age_names <- c(
+                    `1` = "age 1",
+                    `2` = "age 2",
+                    `3` = "age 3",
+                    `4` = "age 4",
+                    `5` = "age 5",
+                    `6` = "age 6"
+                    )
+
+eigen.age <- ggplot(eigen.alignment,
+       aes(x = year, y = eigen_alignment))+ 
+  geom_point()+
+  geom_line()+
+  facet_wrap(vars(age), 
+             labeller = as_labeller(age_names),
+             strip.position="left",
+             ncol = 1)+
+  xlab("Year")+
+  ylab("")+
+  theme_bw()+
+  theme(
+        axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank())+
+  # set lable position and rotate
+  theme(strip.background = element_blank(),
+    strip.placement = "outside",
+    strip.text.y.left = element_text(angle = 0)
+  )+
+  scale_y_continuous(breaks = seq(0, 1, by = 0.3))+
+  # rotate y lable
+  #theme(axis.title.y = element_text(angle = 0, vjust = 0.5))+
+  ggtitle("Relative contribution to population stability")
+
+  
+eigen.age        
+
+
+```
+
+
+# plot younger (age 1+2+3) and older (age 3+5+6)
+```{r}
+
+# 1 create [eigen.alignment.young.old]
+eigen.alignment.young.old <- eigen.alignment %>% 
+  mutate(older_younger = 
+           ifelse((age %in% c(4,5,6)),
+                  'older','younger')) %>% 
+  group_by(year,older_younger) %>% 
+  summarise(sum_alignment = sum(eigen_alignment))
+
+# 2 plot, color as younger, older
+ggplot(eigen.alignment.young.old,
+       aes(x = year, y = sum_alignment,
+           color = older_younger))+ 
+  geom_point()+
+  geom_line()+
+  xlab("Year")+
+  ylab("contribution to population stability")+
+  theme_bw()
+
+
+eigen.alignment %>% 
+  group_by(age) %>% 
+  summarise(mean_eigen = mean(eigen_alignment))
+
+```
+
+
+# eigenvector violin plot
+```{r}
+
+
+# violin plot
+eigen.violin <- ggplot(eigen.alignment, aes(x=age, y=eigen_alignment, fill = age)) + # fill=name allow to automatically dedicate a color for each group
+  geom_violin(width=1.6, color="grey")+
+  geom_boxplot(width = 0.3) +
+  geom_point(size=1,shape=21,
+             position=position_jitterdodge(1)) +
+  theme_bw()+
+  theme(legend.position="none",
+        axis.title.y = element_text(angle = 0, vjust = 0.5))+
+  #ylab("Contribution to \npopulation stability") +
+  xlab('')+ylab('')+
+  #ggtitle("alignment values from each of 39 years")+
+  scale_fill_brewer(palette="Paired")+
+  scale_x_discrete(
+    labels= c('age 1', 
+              'age 2',
+              'age 3', 
+              'age 4',
+              'age 5',
+              'age 6'))+
+  ggtitle("Relative contribution to population stability over time")
+  
+eigen.violin
+
+```
+
+# [fig 4] eigenvector violin before & after 2000
+```{r}
+
+eigen.alignment.period <- eigen.alignment %>% 
+  mutate(period = 
+           replace(year,
+                  year <= 2000, 
+                   "1982-2000")) %>% 
+  mutate(period = 
+           replace(period,
+                  year > 2000, 
+                   "2001-2020")) 
+  
+  
+ggplot(eigen.alignment.period, 
+         aes(x=age, y=eigen_alignment, fill = age)) + 
+  # fill=name allow to automatically dedicate a color for each group
+  geom_violin(width=1.6, color="grey")+
+  geom_boxplot(width = 0.3) +
+  geom_point(size=1,shape=21,
+             position=position_jitterdodge(1)) +
+  facet_wrap(vars(period), ncol = 1)+
+  theme_bw()+
+  theme(legend.position="none",
+        axis.title.y = element_text(angle = 0, vjust = 0.5))+
+  xlab('')+ylab('')+
+  scale_fill_brewer(palette="Paired")+
+  scale_x_discrete(
+    labels= c('age 1', 
+              'age 2',
+              'age 3', 
+              'age 4',
+              'age 5',
+              'age 6'))+
+  ggtitle("Relative contribution to population stability")
+  
+ 
+
+```
+
+
+# [fig S3] plot eigenvector by ranking
+```{r}
+
+# assign rank
+(eigen.alignment.period.rank <- 
+  eigen.alignment.period %>% 
+  group_by(year) %>%
+  arrange((eigen_alignment)) %>% 
+  mutate(rank = 1:n()) %>% 
+  arrange(year)) 
+  
+
+# boxplot
+ggplot(eigen.alignment.period.rank, 
+         aes(x= age, y= rank, fill = age)) + 
+  # fill=name allow to automatically dedicate a color for each group
+  #geom_violin(width=1.6, color="grey")+
+  geom_boxplot(width = 0.3) +
+  geom_point(size=1,shape=21,
+             position=position_jitterdodge(1)) +
+  facet_wrap(vars(period), ncol = 1)+
+  theme_bw()+
+  theme(legend.position="none",
+        axis.title.y = element_text(angle = 0, vjust = 0.5))+
+  xlab('')+ylab('')+
+  scale_fill_brewer(palette="Paired")+
+   scale_y_continuous(breaks = seq(1, 6, by = 1))+
+  scale_x_discrete(
+    labels= c('age 1', 
+              'age 2',
+              'age 3', 
+              'age 4',
+              'age 5',
+              'age 6'))+
+  ggtitle("Relative contribution to population stability with ranking")+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank())
+
+```
+
+
+
+
