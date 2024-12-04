@@ -16,6 +16,7 @@ This script provides functions to run MDR-Smap. We modified two places in this s
 
 [Demo_MDR_Smap_20210625.R] is from Chang et al. 2021 https://onlinelibrary.wiley.com/doi/10.1111/ele.13897
 This script provides demonstration on running the functions in [Demo_MDR_function.R]. 
+  
 
 To reproduce the results of this paper, run the following three scripts subsequently: [mc_nonlinearity.qmd], then [mc_mdr_smap.Rmd], then [mc_stability_analysis.Rmd].
 
